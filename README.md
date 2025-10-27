@@ -15,6 +15,34 @@ The robot features 4-wheel mecanum drive with full omnidirectional movement capa
 - **AS5600 Magnetic Encoders** - PWM output mode (more on this below)
 - **Power: 2S LIon battery** with basic voltage regulation
 
+## CAD Design
+
+The robot chassis was designed entirely in Fusion 360, featuring a modular design for easy assembly and maintenance. The frame provides stable mounting for all components while keeping the overall footprint compact.
+
+![CAD Design Collage](cad_collage.jpg)
+
+**Key Design Features:**
+- **Modular motor mounts** with integrated encoder alignment
+- **Central electronics compartment** with ventilation
+- **Battery mounting system** with easy access
+- **Cable management channels** to keep wiring organized
+- **Sensor mounting points** prepared for future LiDAR integration
+- **Adjustable wheelbase** for different mecanum wheel sizes
+
+The design prioritizes accessibility - all components can be serviced without disassembling the entire robot. 3D printed parts use PETG filament for durability, with metal inserts for threaded fasteners.
+
+## Photos
+
+### LiDAR Mapping Test
+Early testing with RPLiDAR A1 sensor for mapping capabilities:
+
+![LiDAR Mapping Test](IMG_7881.jpg)
+
+### AS5600 Encoder Magnet
+Diametrically polarized magnet mounted on motor shaft for precise angle detection:
+
+![AS5600 Encoder Magnet](IMG_8020.jpg)
+
 ## Software Architecture
 
 ### ESP32 Programming Notes
