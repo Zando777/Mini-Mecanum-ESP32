@@ -1,6 +1,6 @@
 # Mini Mecanum ESP32 Robot - Weekend Project
 
-![Robot Image](27_10_2025.jpg)
+![Robot Image](images/27_10_2025.jpg)
 
 ## Overview
 
@@ -19,7 +19,7 @@ The robot features 4-wheel mecanum drive with full omnidirectional movement capa
 
 The robot chassis was designed entirely in Fusion 360, featuring a modular design for easy assembly and maintenance. The frame provides stable mounting for all components while keeping the overall footprint compact.
 
-![CAD Design Collage](cad_collage.jpg)
+![CAD Design Collage](images/cad_collage.jpg)
 
 **Key Design Features:**
 - **Modular motor mounts** with integrated encoder alignment
@@ -36,12 +36,12 @@ The design prioritizes accessibility - all components can be serviced without di
 ### LiDAR Mapping Test
 Early testing with RPLiDAR A1 sensor for mapping capabilities:
 
-![LiDAR Mapping Test](IMG_7881.jpg)
+![LiDAR Mapping Test](images/IMG_7881.jpg)
 
 ### AS5600 Encoder Magnet
 Diametrically polarized magnet mounted on motor shaft for precise angle detection:
 
-![AS5600 Encoder Magnet](IMG_8020.jpg)
+![AS5600 Encoder Magnet](images/IMG_8020.jpg)
 
 ## Software Architecture
 
