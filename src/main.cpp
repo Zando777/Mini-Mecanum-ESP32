@@ -4,6 +4,9 @@
 // Controls 4 DC motors with AS5600 PWM encoders.
 // Web interface for movement control and live encoder readout.
 // OTA (Over-The-Air) firmware updates via Arduino IDE.
+// Author: Alexander Steffen
+// Date: October 2025
+// Project: Weekend exploration of mecanum kinematics and ESP32
 // ------------------------------
 
 #include <Arduino.h>
@@ -15,86 +18,131 @@
 WebServer server(80);
 
 // ------------------------------
-// Motor & Encoder Config
+// Motor & Encoder Configuration
 // ------------------------------
+// Robot uses 4 DC motors with mecanum wheels in X configuration
+// AS5600 encoders provide PWM output for position feedback
+// Note: AS5600s all have same I2C address (0x36) - using PWM mode as workaround
+// TODO: Add I2C multiplexer for proper encoder communication
 #define NUM_MOTORS 4
 
+// Encoder PWM input pins (AS5600 PWM output mode)
 const int ENC_PWM_PINS[NUM_MOTORS] = {32, 33, 34, 35};
 
+// Motor driver pins (TB6612FNG H-bridge)
 struct MotorPins { int IN1, IN2; };
 MotorPins motorPins[NUM_MOTORS] = {
-  {14, 27}, // FL
-  {5, 18},  // FR
-  {13, 12}, // BL
-  {26, 25}  // BR
+  {14, 27}, // Front Left (FL)
+  {5, 18},  // Front Right (FR)
+  {13, 12}, // Back Left (BL)
+  {26, 25}  // Back Right (BR)
 };
 
-int robotSpeed = 150;  // default speed (0–255)
-float moveX = 0;       // strafe left/right (-1..1)
-float moveY = 0;       // forward/back (-1..1)
-float rotate = 0;      // rotate CCW/CW (-1..1)
+// Movement control variables (-1.0 to 1.0 range)
+int robotSpeed = 150;  // default speed (0–255 PWM)
+float moveX = 0;       // strafe left (-) / right (+) (-1..1)
+float moveY = 0;       // forward (+) / back (-) (-1..1)
+float rotate = 0;      // rotate CCW (-) / CW (+) (-1..1)
+
+// Encoder reading timeout (microseconds)
 const int PULSE_TIMEOUT = 50000; // 50ms timeout for encoders
 
-// PWM setup constants
-#define PWM_FREQ 20000
-#define PWM_RES 8
+// PWM setup constants for motor control
+#define PWM_FREQ 20000  // 20kHz PWM frequency for quiet operation
+#define PWM_RES 8       // 8-bit resolution (0-255)
 
 // ------------------------------
-// Helper Functions
+// Encoder Reading Functions
 // ------------------------------
+/**
+ * Read PWM duty cycle from AS5600 encoder
+ * @param idx Motor index (0-3)
+ * @return Duty cycle (0.0-1.0) or -1.0 on timeout
+ */
 float readEncoderDuty(int idx) {
   int pin = ENC_PWM_PINS[idx];
   unsigned long highTime = pulseIn(pin, HIGH, PULSE_TIMEOUT);
-  if(highTime == 0) return -1;
+  if(highTime == 0) return -1;  // Timeout - no signal
   unsigned long lowTime = pulseIn(pin, LOW, PULSE_TIMEOUT);
-  if(lowTime == 0) return -1;
+  if(lowTime == 0) return -1;   // Timeout - incomplete signal
   return (float)highTime / (highTime + lowTime);
 }
 
+/**
+ * Convert PWM duty cycle to angle in degrees
+ * @param duty Duty cycle (0.0-1.0)
+ * @return Angle in degrees (0-360)
+ */
 float dutyToDeg(float duty) {
   return duty * 360.0f;
 }
 
-// --- proper Mecanum wheel mapping + min PWM compensation ---
+/**
+ * Calculate motor speeds for mecanum wheel kinematics
+ * Implements proper wheel vectoring for omnidirectional movement
+ * @param mx Strafe component (-1=left, +1=right)
+ * @param my Forward component (-1=back, +1=forward)
+ * @param rot Rotation component (-1=CCW, +1=CW)
+ * @param speeds Output array for motor speeds (-255 to +255)
+ */
 void calculateMotorSpeeds(float mx, float my, float rot, int speeds[4]) {
-  // mx = strafe (right +), my = forward (+), rot = clockwise (+)
-  float fl =  my + mx + rot;
-  float fr =  my - mx - rot;
-  float bl =  my - mx + rot;
-  float br =  my + mx - rot;
+  // Mecanum wheel kinematic equations for X configuration
+  // FL and BR wheels:  my + mx + rot
+  // FR and BL wheels:  my - mx - rot
+  float fl =  my + mx + rot;  // Front Left
+  float fr =  my - mx - rot;  // Front Right
+  float bl =  my - mx + rot;  // Back Left
+  float br =  my + mx - rot;  // Back Right
 
-  // normalize to -1..1
+  // Normalize to prevent exceeding motor limits
   float maxMag = max(max(fabs(fl), fabs(fr)), max(fabs(bl), fabs(br)));
-  if (maxMag < 1.0f) maxMag = 1.0f;
-  fl /= maxMag; fr /= maxMag; bl /= maxMag; br /= maxMag;
+  if (maxMag > 1.0f) {
+    fl /= maxMag; fr /= maxMag; bl /= maxMag; br /= maxMag;
+  }
 
-  const int minPWM = 70;        // motors won't move below this
+  // Apply minimum PWM threshold and speed scaling
+  const int minPWM = 70;  // Motors won't start below this PWM value
+  float speedRange = robotSpeed - minPWM;
+
   for (int i = 0; i < 4; i++) {
     float v = (i==0)?fl:(i==1)?fr:(i==2)?bl:br;
-    int pwm = (int)(abs(v) * (robotSpeed - minPWM) + (v!=0?minPWM:0));
-    speeds[i] = (v >= 0) ? pwm : -pwm;
+    int pwm = (int)(fabs(v) * speedRange + (v != 0 ? minPWM : 0));
+    speeds[i] = (v >= 0) ? pwm : -pwm;  // Negative = reverse direction
   }
 }
 
+/**
+ * Initialize PWM channels for motor control
+ * Uses ESP32 LEDC peripheral for hardware PWM generation
+ */
 void setupPWM() {
-  // Setup PWM channels for motors
+  // Setup PWM channels for motors (2 channels per motor for H-bridge)
   for (int i = 0; i < NUM_MOTORS; i++) {
-    ledcSetup(i*2, PWM_FREQ, PWM_RES);
-    ledcSetup(i*2+1, PWM_FREQ, PWM_RES);
-    ledcAttachPin(motorPins[i].IN1, i*2);
-    ledcAttachPin(motorPins[i].IN2, i*2+1);
+    ledcSetup(i*2, PWM_FREQ, PWM_RES);       // IN1 pin
+    ledcSetup(i*2+1, PWM_FREQ, PWM_RES);     // IN2 pin
+    ledcAttachPin(motorPins[i].IN1, i*2);    // Attach IN1 to channel
+    ledcAttachPin(motorPins[i].IN2, i*2+1);  // Attach IN2 to channel
   }
 }
 
+/**
+ * Drive individual motor with specified speed and direction
+ * @param idx Motor index (0-3)
+ * @param speed Speed value (-255 to +255, negative = reverse)
+ */
 void driveMotor(int idx, int speed) {
-  int pwm = constrain(abs(speed), 0, 255);
+  int pwm = constrain(abs(speed), 0, 255);  // Ensure PWM is within 0-255 range
+
   if (speed > 0) {
+    // Forward: IN1 = PWM, IN2 = 0
     ledcWrite(idx*2, pwm);
     ledcWrite(idx*2+1, 0);
   } else if (speed < 0) {
+    // Reverse: IN1 = 0, IN2 = PWM
     ledcWrite(idx*2, 0);
     ledcWrite(idx*2+1, pwm);
   } else {
+    // Stop: Both pins low
     ledcWrite(idx*2, 0);
     ledcWrite(idx*2+1, 0);
   }
@@ -237,18 +285,22 @@ void handleManeuver() {
 // Setup & Loop
 // ------------------------------
 void setup() {
+  // Initialize serial communication for debugging
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== Booting Mecanum Robot ===");
 
-  for (int i=0;i<NUM_MOTORS;i++){
+  // Configure motor driver pins as outputs
+  for (int i = 0; i < NUM_MOTORS; i++) {
     pinMode(motorPins[i].IN1, OUTPUT);
     pinMode(motorPins[i].IN2, OUTPUT);
-    pinMode(ENC_PWM_PINS[i], INPUT);
+    pinMode(ENC_PWM_PINS[i], INPUT);  // Encoder PWM inputs
   }
 
+  // Initialize PWM for motor control
   setupPWM();
 
+  // Connect to WiFi network
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.printf("Connecting to WiFi %s", ssid);
@@ -258,13 +310,13 @@ void setup() {
   }
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // OTA Setup
+  // Setup Over-The-Air updates
   ArduinoOTA.setHostname("MecanumBot");
-  // ArduinoOTA.setPassword("admin"); // Remove password for testing
+  // ArduinoOTA.setPassword("admin"); // Password disabled for easier testing
   ArduinoOTA.begin();
   Serial.println("OTA Ready. Use 'MecanumBot.local' in Arduino IDE.");
 
-  // Web server routes
+  // Configure web server routes
   server.on("/", handleRoot);
   server.on("/speed", handleSpeed);
   server.on("/move", handleMove);
@@ -272,22 +324,32 @@ void setup() {
   server.on("/maneuver", handleManeuver);
   server.on("/encoders", handleEncoders);
   server.begin();
-  Serial.println("Web server started.");
+  Serial.println("Web server started on port 80.");
 }
 
 void loop() {
+  // Handle OTA update requests
   ArduinoOTA.handle();
+
+  // Process incoming web server requests
   server.handleClient();
 
+  // Calculate and apply motor speeds based on current movement commands
   int speeds[4];
   calculateMotorSpeeds(moveX, moveY, rotate, speeds);
-  for (int i = 0; i < 4; i++) driveMotor(i, speeds[i]);
-
-  static unsigned long t0 = 0;
-  if (millis() - t0 > 2000) {
-    Serial.printf("Speed=%d  X=%.2f  Y=%.2f  R=%.2f\n", robotSpeed, moveX, moveY, rotate);
-    t0 = millis();
+  for (int i = 0; i < 4; i++) {
+    driveMotor(i, speeds[i]);
   }
+
+  // Periodic status logging (every 2 seconds)
+  static unsigned long lastStatusTime = 0;
+  if (millis() - lastStatusTime > 2000) {
+    Serial.printf("Speed=%d  X=%.2f  Y=%.2f  R=%.2f\n",
+                  robotSpeed, moveX, moveY, rotate);
+    lastStatusTime = millis();
+  }
+
+  // Small delay to prevent overwhelming the processor
   delay(50);
 }
 
