@@ -312,7 +312,7 @@ void setup() {
 
   // Setup Over-The-Air updates
   ArduinoOTA.setHostname("MecanumBot");
-  // ArduinoOTA.setPassword("admin"); // Password disabled for easier testing
+  ArduinoOTA.setPassword("admin");
   ArduinoOTA.begin();
   Serial.println("OTA Ready. Use 'MecanumBot.local' in Arduino IDE.");
 
