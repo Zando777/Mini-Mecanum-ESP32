@@ -1,7 +1,7 @@
 // ------------------------------
 // ESP32 Mecanum Robot Control + OTA Update
 // ------------------------------
-// Controls 4 DC motors with AS5600 PWM encoders.
+// Controls 4 DC motors with AS5600 analog encoders.
 // Web interface for movement control and live encoder readout.
 // OTA (Over-The-Air) firmware updates via Arduino IDE.
 // Author: Alexander Steffen
@@ -21,13 +21,13 @@ WebServer server(80);
 // Motor & Encoder Configuration
 // ------------------------------
 // Robot uses 4 DC motors with mecanum wheels in X configuration
-// AS5600 encoders provide PWM output for position feedback
-// Note: AS5600s all have same I2C address (0x36) - using PWM mode as workaround
+// AS5600 encoders provide analog voltage output (0-3.3V) for position feedback
+// Analog voltage represents rotational position: 0V=0°, 3.3V=360°
 // TODO: Add I2C multiplexer for proper encoder communication
 #define NUM_MOTORS 4
 
-// Encoder PWM input pins (AS5600 PWM output mode)
-const int ENC_PWM_PINS[NUM_MOTORS] = {32, 33, 34, 35};
+// Encoder analog input pins (AS5600 analog output mode)
+const int ENC_ANALOG_PINS[NUM_MOTORS] = {32, 33, 34, 35};
 
 // Motor driver pins (TB6612FNG H-bridge)
 struct MotorPins { int IN1, IN2; };
@@ -44,8 +44,7 @@ float moveX = 0;       // strafe left (-) / right (+) (-1..1)
 float moveY = 0;       // forward (+) / back (-) (-1..1)
 float rotate = 0;      // rotate CCW (-) / CW (+) (-1..1)
 
-// Encoder reading timeout (microseconds)
-const int PULSE_TIMEOUT = 50000; // 50ms timeout for encoders
+
 
 // PWM setup constants for motor control
 #define PWM_FREQ 20000  // 20kHz PWM frequency for quiet operation
@@ -55,26 +54,25 @@ const int PULSE_TIMEOUT = 50000; // 50ms timeout for encoders
 // Encoder Reading Functions
 // ------------------------------
 /**
- * Read PWM duty cycle from AS5600 encoder
+ * Read analog voltage from AS5600 encoder
  * @param idx Motor index (0-3)
- * @return Duty cycle (0.0-1.0) or -1.0 on timeout
+ * @return Voltage (0.0-3.3V) or -1.0 on error
  */
-float readEncoderDuty(int idx) {
-  int pin = ENC_PWM_PINS[idx];
-  unsigned long highTime = pulseIn(pin, HIGH, PULSE_TIMEOUT);
-  if(highTime == 0) return -1;  // Timeout - no signal
-  unsigned long lowTime = pulseIn(pin, LOW, PULSE_TIMEOUT);
-  if(lowTime == 0) return -1;   // Timeout - incomplete signal
-  return (float)highTime / (highTime + lowTime);
+float readEncoderVoltage(int idx) {
+  int pin = ENC_ANALOG_PINS[idx];
+  int adcValue = analogRead(pin);
+  if(adcValue < 0 || adcValue > 4095) return -1;  // Invalid reading
+  return (float)adcValue * 3.3f / 4095.0f;
 }
 
 /**
- * Convert PWM duty cycle to angle in degrees
- * @param duty Duty cycle (0.0-1.0)
+ * Convert analog voltage to angle in degrees
+ * @param voltage Voltage (0.0-3.3V)
  * @return Angle in degrees (0-360)
  */
-float dutyToDeg(float duty) {
-  return duty * 360.0f;
+float voltageToDeg(float voltage) {
+  if(voltage < 0.0f) return -1.0f;  // Error condition
+  return (voltage / 3.3f) * 360.0f;
 }
 
 /**
@@ -251,9 +249,9 @@ void handleRotate() {
 void handleEncoders() {
   String res;
   for (int i = 0; i < NUM_MOTORS; i++) {
-    float duty = readEncoderDuty(i);
-    if (duty < 0) res += String("Motor ") + char('A'+i) + ": No Signal\n";
-    else res += String("Motor ") + char('A'+i) + ": " + String(dutyToDeg(duty), 1) + "°\n";
+    float voltage = readEncoderVoltage(i);
+    if (voltage < 0) res += String("Motor ") + char('A'+i) + ": No Signal\n";
+    else res += String("Motor ") + char('A'+i) + ": " + String(voltageToDeg(voltage), 1) + "°\n";
   }
   server.send(200, "text/plain", res);
 }
@@ -294,7 +292,7 @@ void setup() {
   for (int i = 0; i < NUM_MOTORS; i++) {
     pinMode(motorPins[i].IN1, OUTPUT);
     pinMode(motorPins[i].IN2, OUTPUT);
-    pinMode(ENC_PWM_PINS[i], INPUT);  // Encoder PWM inputs
+    pinMode(ENC_ANALOG_PINS[i], INPUT);  // Encoder analog inputs
   }
 
   // Initialize PWM for motor control

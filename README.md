@@ -21,20 +21,12 @@ The robot chassis was designed entirely in Fusion 360, featuring a modular desig
 
 ![CAD Design Collage](images/cad_collage.jpg)
 
-**Key Design Features:**
-- **Modular motor mounts** with integrated encoder alignment
-- **Central electronics compartment** with ventilation
-- **Battery mounting system** with easy access
-- **Cable management channels** to keep wiring organized
-- **Sensor mounting points** prepared for future LiDAR integration
-- **Adjustable wheelbase** for different mecanum wheel sizes
-
-The design prioritizes accessibility - all components can be serviced without disassembling the entire robot. 3D printed parts use PETG filament for durability, with metal inserts for threaded fasteners.
+Designed for 3D printing and ease of repair and components access. Self threading M3 holes and brass heat-set inserts were used. Integrated mounting points for future sensors like LiDAR and IMU.
 
 ## Photos
 
 ### LiDAR Mapping Test
-Early testing with RPLiDAR A1 sensor for mapping capabilities:
+Early testing with cheap robot vacuum LiDAR sensor for mapping capabilities:
 
 ![LiDAR Mapping Test](images/IMG_7881.jpg)
 
@@ -60,8 +52,8 @@ The code leverages several ESP32-specific features:
 
 One major challenge I encountered was with the AS5600 magnetic encoders. These sensors use I2C communication, but all AS5600s ship with the same default I2C address (0x36). This creates a bus conflict when trying to use multiple encoders.
 
-**Current Workaround**: Using PWM output mode instead of I2C. The AS5600 can output a PWM signal proportional to the magnetic field angle, which I'm reading with `pulseIn()`. However, this is suboptimal because:
-- PWM reading is blocking and less precise than I2C
+**Current Workaround**: Using voltage output mode instead of I2C. The AS5600 can output a voltage signal proportional to the magnetic field angle, which I'm reading with `analogRead()`. However, this is suboptimal because:
+- Voltage reading is blocking and less precise than I2C
 - Limited update rate compared to I2C mode
 - Requires more CPU cycles for processing
 
@@ -80,7 +72,7 @@ The robot features a responsive web interface with:
 ## Future Plans
 
 ### Sensor Integration
-- **2D LiDAR**: RPLiDAR A1 or similar for mapping and obstacle avoidance
+- **2D LiDAR**: LDS02RR for mapping and obstacle avoidance
 - **IMU**: For orientation tracking and improved odometry
 - **Ultrasonic sensors**: Basic proximity detection
 
