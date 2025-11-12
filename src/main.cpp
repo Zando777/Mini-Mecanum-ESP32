@@ -13,7 +13,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ArduinoOTA.h>
 #include "wifi_config.h"
 
 WebServer server(80);
