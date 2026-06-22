@@ -783,6 +783,10 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
  * sweeps channels to find this robot, so no peer needs adding here.
  */
 void initEspNow() {
+  // Disable WiFi power-save: when associated to an AP the STA otherwise sleeps
+  // between beacons and drops most ESP-NOW packets.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESP-NOW] init FAILED");
     return;
