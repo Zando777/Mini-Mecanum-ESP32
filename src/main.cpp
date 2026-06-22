@@ -13,9 +13,44 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include "wifi_config.h"
 
+// Channel to park on for ESP-NOW when no WiFi AP is reachable (bench use).
+// When connected to the router, the AP fixes the channel instead.
+#define ESPNOW_FALLBACK_CHANNEL 1
+
+// Per-loop motor debug prints. Off by default: at 100 Hz they exceed the
+// serial baud rate and stall the control loop. Set to 1 only for bring-up.
+#define MOTOR_DEBUG 0
+
 WebServer server(80);
+
+// ------------------------------
+// ESP-NOW control protocol
+// ------------------------------
+// ControlCommand must stay byte-identical to the controller's shared
+// firmware/shared/espnow_data.h. Sent controller -> robot at ~50 Hz.
+#define CONTROL_PROTOCOL_VERSION 1
+
+typedef struct __attribute__((packed)) {
+  uint8_t version;   // protocol version
+  uint8_t seq;       // rolling counter, for debug / loss detection
+  int8_t  x;         // strafe    -100..100 (left .. right)
+  int8_t  y;         // forward   -100..100 (back .. forward)
+  int8_t  rot;       // rotation  -100..100 (CCW .. CW)
+  uint8_t speed;     // master speed 0..255
+  uint8_t buttons;   // bit0=leftBtn, bit1=rightBtn, bit2=aux
+} ControlCommand;     // 7 bytes packed
+
+// ESP-NOW control state. The failsafe is scoped to ESP-NOW so that web
+// control (which sets persistent directions) is not affected by it.
+volatile bool espNowControlActive = false;      // last motion came from ESP-NOW
+volatile unsigned long lastEspNowMs = 0;         // time of last ESP-NOW packet
+volatile unsigned long espNowPacketCount = 0;    // total packets received (diag)
+#define ESPNOW_FAILSAFE_MS 400                   // stop if no packet within this
 
 // ------------------------------
 // Motor Configuration (Preserved pins)
@@ -43,6 +78,24 @@ float moveRot = 0;     // rotation: -1 (CCW) to +1 (CW)
 // Encoder calibration data
 float encoderOffsets[NUM_MOTORS] = {0, 0, 0, 0};  // Calibration offsets
 bool encoderCalibrated = false;                   // Calibration status
+
+// ------------------------------
+// Odometry (approximate displacement from wheel encoders)
+// ------------------------------
+#define WHEEL_DIAMETER_MM 48.0
+#define WHEEL_CIRC_MM (WHEEL_DIAMETER_MM * 3.14159265358979)
+// Geometry factor (half-wheelbase + half-track) in mm, scales rotation.
+// Approximate - tune so a known turn reads correctly.
+#define ODOM_LXY_MM 90.0
+// Per-wheel sign mapping encoder-angle-increase to forward roll.
+// Calibrate: drive straight forward, each wheel's contribution should be +.
+const float ENC_SIGN[NUM_MOTORS] = {1.0, 1.0, 1.0, 1.0};
+
+double odoX = 0.0;        // mm, forward from start
+double odoY = 0.0;        // mm, left from start
+double odoHeading = 0.0;  // rad, CCW from start
+double encPrevDeg[NUM_MOTORS];
+bool odoInit = false;
 
 // PWM Configuration - Improved for reliability
 #define PWM_FREQ 20000  // 20kHz (quiet operation)
@@ -159,7 +212,7 @@ void calculateMotorSpeeds(float mx, float my, float mr, int speeds[4]) {
   float br = my + mx - mr;  // Back Right
 
   // Debug output for input values
-  Serial.printf("Input: mx=%.2f, my=%.2f, mr=%.2f\n", mx, my, mr);
+  if (MOTOR_DEBUG) Serial.printf("Input: mx=%.2f, my=%.2f, mr=%.2f\n", mx, my, mr);
 
   // Simple normalization to prevent exceeding limits
   float maxSpeed = max(max(abs(fl), abs(fr)), max(abs(bl), abs(br)));
@@ -180,8 +233,7 @@ void calculateMotorSpeeds(float mx, float my, float mr, int speeds[4]) {
   speeds[1] = -speeds[1];  // Front Right
   speeds[3] = -speeds[3];  // Back Right
 
-  // Always show debug output for troubleshooting
-  Serial.printf("Calculated: FL=%d FR=%d BL=%d BR=%d (baseSpeed=%d)\n",
+  if (MOTOR_DEBUG) Serial.printf("Calculated: FL=%d FR=%d BL=%d BR=%d (baseSpeed=%d)\n",
                 speeds[0], speeds[1], speeds[2], speeds[3], baseSpeed);
 }
 
@@ -205,25 +257,23 @@ void setupPWM() {
  */
 void driveMotor(int idx, int speed) {
   speed = constrain(speed, -255, 255);  // Ensure speed is within range
-  
-  // Diagnostic: Show which motor is being driven
-  static const char* motorNames[] = {"FL", "FR", "BL", "BR"};
-  Serial.printf("DRIVE MOTOR %s: Speed=%d (IN1=%d, IN2=%d)\n",
-                motorNames[idx], speed, idx*2, idx*2+1);
-  
+
+  if (MOTOR_DEBUG) {
+    static const char* motorNames[] = {"FL", "FR", "BL", "BR"};
+    Serial.printf("DRIVE MOTOR %s: Speed=%d (IN1=%d, IN2=%d)\n",
+                  motorNames[idx], speed, idx*2, idx*2+1);
+  }
+
   if (speed > 0) {
     // Forward: IN1 = PWM, IN2 = 0
-    Serial.printf("  Forward: IN1=%d, IN2=%d\n", speed, 0);
     ledcWrite(idx*2, speed);
     ledcWrite(idx*2+1, 0);
   } else if (speed < 0) {
     // Reverse: IN1 = 0, IN2 = PWM
-    Serial.printf("  Reverse: IN1=%d, IN2=%d\n", 0, -speed);
     ledcWrite(idx*2, 0);
     ledcWrite(idx*2+1, -speed);
   } else {
     // Stop: Both pins low
-    Serial.printf("  Stop: IN1=%d, IN2=%d\n", 0, 0);
     ledcWrite(idx*2, 0);
     ledcWrite(idx*2+1, 0);
   }
@@ -354,6 +404,12 @@ h1 { color: #333; }
 <div class="encoder-display">
   <h3>Motor Encoder Readings</h3>
   <pre id="encoders">Loading encoder data...</pre>
+</div>
+
+<div class="encoder-display">
+  <h3>Odometry (approx displacement)</h3>
+  <pre id="odom">Loading odometry...</pre>
+  <button class="button stop" onclick="resetOdom()">Reset Odometry</button>
 </div>
 
 <script>
@@ -505,6 +561,20 @@ setInterval(() => {
     });
 }, 1000);
 
+// Update odometry twice a second
+setInterval(() => {
+  fetch('/odometry')
+    .then(response => response.json())
+    .then(d => {
+      document.getElementById('odom').innerText =
+        'X: ' + d.x + ' mm\nY: ' + d.y + ' mm\nHeading: ' + d.heading + ' deg';
+    });
+}, 500);
+
+function resetOdom() {
+  fetch('/resetOdometry');
+}
+
 // Initialize joystick when page loads
 window.onload = initJoystick;
 </script>
@@ -522,6 +592,7 @@ void handleSpeed() {
 }
 
 void handleMove() {
+  espNowControlActive = false;  // web takes over from ESP-NOW
   String dir = server.arg("dir");
   if (dir == "forward") {
     moveY = 1.0; moveX = 0.0; moveRot = 0.0;
@@ -616,6 +687,8 @@ void handleJoystick() {
     Serial.printf("  %s = %s\n", server.argName(i).c_str(), server.arg(i).c_str());
   }
   
+  espNowControlActive = false;  // web takes over from ESP-NOW
+
   // Handle analog joystick input for X, Y, and rotation
   if (server.hasArg("x")) {
     moveX = server.arg("x").toFloat();
@@ -679,6 +752,107 @@ void handleEncoders() {
 }
 
 // ------------------------------
+// ESP-NOW receive path
+// ------------------------------
+/**
+ * ESP-NOW receive callback. Writes the incoming command into the shared
+ * movement globals so the existing loop() pipeline drives the wheels.
+ */
+void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len != sizeof(ControlCommand)) return;          // wrong packet, ignore
+  ControlCommand cmd;
+  memcpy(&cmd, data, sizeof(cmd));
+  if (cmd.version != CONTROL_PROTOCOL_VERSION) return; // firmware mismatch
+
+  moveX   = cmd.x   / 100.0f;
+  moveY   = cmd.y   / 100.0f;
+  moveRot = cmd.rot / 100.0f;
+  moveX   = constrain(moveX,   -1.0f, 1.0f);
+  moveY   = constrain(moveY,   -1.0f, 1.0f);
+  moveRot = constrain(moveRot, -1.0f, 1.0f);
+  robotSpeed = cmd.speed;
+
+  espNowControlActive = true;
+  lastEspNowMs = millis();
+  espNowPacketCount++;
+}
+
+/**
+ * Initialise ESP-NOW alongside the existing WiFi STA connection.
+ * Receives on whatever channel the STA link is using; the controller
+ * sweeps channels to find this robot, so no peer needs adding here.
+ */
+void initEspNow() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] init FAILED");
+    return;
+  }
+  esp_now_register_recv_cb(onEspNowRecv);
+  Serial.print("[ESP-NOW] Ready. Robot MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+// ------------------------------
+// Odometry update + web handlers
+// ------------------------------
+/**
+ * Integrate wheel encoder deltas into an approximate X/Y/heading pose.
+ * Reads each AS5600 absolute angle, takes the wrapped delta, converts to a
+ * rolled distance, then applies mecanum forward kinematics.
+ */
+void updateOdometry() {
+  static unsigned long last = 0;
+  unsigned long now = millis();
+  if (now - last < 20) return;  // 50 Hz
+  last = now;
+
+  float ang[NUM_MOTORS];
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    int adc = analogRead(ENC_ANALOG_PINS[i]);
+    ang[i] = (adc / 4095.0f) * 360.0f;
+  }
+  if (!odoInit) {
+    for (int i = 0; i < NUM_MOTORS; i++) encPrevDeg[i] = ang[i];
+    odoInit = true;
+    return;
+  }
+
+  double d[NUM_MOTORS];
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    double delta = ang[i] - encPrevDeg[i];
+    if (delta > 180) delta -= 360;
+    else if (delta < -180) delta += 360;
+    encPrevDeg[i] = ang[i];
+    d[i] = (delta / 360.0) * WHEEL_CIRC_MM * ENC_SIGN[i];
+  }
+
+  // Mecanum forward kinematics (inverse of the drive mixing).
+  double dF = (d[0] + d[1] + d[2] + d[3]) / 4.0;          // forward
+  double dS = (d[0] - d[1] - d[2] + d[3]) / 4.0;          // strafe (left +)
+  double dTh = ((d[0] - d[1] + d[2] - d[3]) / 4.0) / ODOM_LXY_MM;  // rotation
+
+  double th = odoHeading + dTh * 0.5;  // midpoint integration
+  odoX += dF * cos(th) - dS * sin(th);
+  odoY += dF * sin(th) + dS * cos(th);
+  odoHeading += dTh;
+}
+
+void handleOdometry() {
+  float hdeg = odoHeading * 180.0 / 3.14159265358979;
+  while (hdeg > 180) hdeg -= 360;
+  while (hdeg < -180) hdeg += 360;
+  char buf[96];
+  snprintf(buf, sizeof(buf), "{\"x\":%.1f,\"y\":%.1f,\"heading\":%.1f}",
+           odoX, odoY, hdeg);
+  server.send(200, "application/json", buf);
+}
+
+void handleResetOdometry() {
+  odoX = 0; odoY = 0; odoHeading = 0; odoInit = false;
+  server.send(200, "text/plain", "OK");
+}
+
+// ------------------------------
 // Setup & Loop - Simplified
 // ------------------------------
 void setup() {
@@ -700,20 +874,40 @@ void setup() {
   // Calibrate encoders at startup
   calibrateEncoders();
 
-  // Connect to WiFi
+  // Connect to WiFi (with timeout so ESP-NOW still starts if no AP is present)
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   Serial.printf("Connecting to WiFi %s", ssid);
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
     delay(500);
     Serial.print(".");
   }
-  Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // Setup OTA updates
-  ArduinoOTA.setHostname("MecanumBot");
-  ArduinoOTA.begin();
-  Serial.println("OTA Ready - Use 'MecanumBot.local' in Arduino IDE");
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected) {
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // Setup OTA updates (only meaningful when on WiFi)
+    ArduinoOTA.setHostname("MecanumBot");
+    ArduinoOTA.begin();
+    Serial.println("OTA Ready - Use 'MecanumBot.local' in Arduino IDE");
+  } else {
+    Serial.println("\nWiFi not connected - running ESP-NOW only (no OTA/web)");
+    // Stop association attempts and park on a fixed channel so ESP-NOW
+    // reception is stable. Without disabling auto-reconnect the STA keeps
+    // scanning every channel, so it is only on channel 1 intermittently and
+    // ESP-NOW link-layer ACKs are lost.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect();
+    delay(100);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_channel(ESPNOW_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("ESP-NOW parked on channel %d\n", ESPNOW_FALLBACK_CHANNEL);
+  }
+
+  // Initialise ESP-NOW control link (coexists with WiFi STA)
+  initEspNow();
 
   // Setup web server routes (simplified)
   server.on("/", handleRoot);
@@ -723,6 +917,8 @@ void setup() {
   server.on("/joystick", handleJoystick);
   server.on("/testJoystick", handleTestJoystick);  // Added test endpoint
   server.on("/encoders", handleEncoders);
+  server.on("/odometry", handleOdometry);
+  server.on("/resetOdometry", handleResetOdometry);
   server.begin();
   Serial.println("Web server started");
 }
@@ -731,6 +927,15 @@ void loop() {
   // Handle OTA and web server requests
   ArduinoOTA.handle();
   server.handleClient();
+
+  // Update odometry estimate from wheel encoders
+  updateOdometry();
+
+  // ESP-NOW failsafe: if the controller link drops, stop the robot.
+  // Scoped to ESP-NOW control so web commands are not affected.
+  if (espNowControlActive && (millis() - lastEspNowMs > ESPNOW_FAILSAFE_MS)) {
+    moveX = 0.0f; moveY = 0.0f; moveRot = 0.0f;
+  }
 
   // Calculate and apply motor speeds (with rotation and diagonal support)
   static int lastSpeeds[4] = {0, 0, 0, 0};
@@ -763,9 +968,14 @@ void loop() {
     Serial.printf("Speed: %d | X: %.2f | Y: %.2f | R: %.2f\n", robotSpeed, moveX, moveY, moveRot);
     Serial.printf("Motor Commands: FL=%d FR=%d BL=%d BR=%d\n", speeds[0], speeds[1], speeds[2], speeds[3]);
     Serial.printf("Moving: %s\n", (abs(moveX) > 0.01 || abs(moveY) > 0.01 || abs(moveRot) > 0.01) ? "YES" : "NO");
-    Serial.printf("WiFi: %s | Encoders: %s\n",
+    uint8_t primaryCh = 0; wifi_second_chan_t sc;
+    esp_wifi_get_channel(&primaryCh, &sc);
+    Serial.printf("WiFi: %s | Encoders: %s | Ch: %d | RxPkts: %lu\n",
                   WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
-                  encoderCalibrated ? "Calibrated" : "Calibrating");
+                  encoderCalibrated ? "Calibrated" : "Calibrating",
+                  primaryCh, espNowPacketCount);
+    Serial.printf("Odometry: X=%.0fmm Y=%.0fmm Hdg=%.0fdeg\n",
+                  odoX, odoY, odoHeading * 180.0 / 3.14159265358979);
     Serial.printf("====================\n\n");
     lastStatusTime = millis();
   }
